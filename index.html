@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>健康記録ノート</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, onValue, get } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyD5YjkNZYq3CYomRcxFNwGwQI4ydIHw7MY",
+  authDomain: "helth-2d111.firebaseapp.com",
+  databaseURL: "https://helth-2d111-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "helth-2d111",
+  storageBucket: "helth-2d111.firebasestorage.app",
+  messagingSenderId: "264240426943",
+  appId: "1:264240426943:web:1a666cfb400000a4023b0a"
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const database = getDatabase(firebaseApp);
+
+// ===== 暗号化ユーティリティ =====
+async function sha256(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+async function deriveKey(roomId, password) {
+  const raw = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(roomId + ':' + password));
+  return crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+}
+async function encrypt(key, data) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(JSON.stringify(data)));
+  const combined = new Uint8Array(iv.length + enc.byteLength);
+  combined.set(iv); combined.set(new Uint8Array(enc), iv.length);
+  return btoa(String.fromCharCode(...combined));
+}
+async function decrypt(key, b64) {
+  try {
+    const combined = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const iv = combined.slice(0, 12);
+    const data = combined.slice(12);
+    const dec = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, data);
+    return JSON.parse(new TextDecoder().decode(dec));
+  } catch(e) { return null; }
+}
+
+// ===== グローバル状態 =====
+let SESSION = {roomId:'', userName:'', cryptoKey:null, pwHash:''};
+let DB = {bp:[], temp:[], spo2:[], water:[], urine:[], stool:[], photos:{}};
+let TMP = {uv:0, uc:'', ucn:'', sc:'', scn:'', shape:'', sa:''};
+let graphRange = '7d';
+let chartInst = {};
+let unsubscribe = null;
+
+// ===== 日時ユーティリティ =====
+function nowDTLocal() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function dtToKey(dtStr) { return dtStr ? dtStr.slice(0,10) : todayKey(); }
+function dtToDisplay(dtStr) {
+  if (!dtStr) return '';
+  const d = new Date(dtStr);
+  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function todayStr() {
+  return new Date().toLocaleDateString('ja-JP', {year:'numeric', month:'long', day:'numeric', weekday:'short'});
+}
+
+// ===== UI ヘルパー =====
+function showToast(msg, dur=2500) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), dur);
+}
+function setSyncDot(state) {
+  const d = document.getElementById('sync-dot');
+  d.className = 'sync-dot';
+  if (state === 'on') d.classList.add('on');
+  else if (state === 'sync') d.classList.add('sync');
+  else if (state === 'err') d.classList.add('err');
+}
+
+// ===== Firebase 同期 =====
+async function pushToFirebase() {
+  if (!SESSION.cryptoKey || !SESSION.roomId) return;
+  setSyncDot('sync');
+  try {
+    const enc = await encrypt(SESSION.cryptoKey, DB);
+    const ts = Date.now();
+    lastPushTs = ts;
+    const dbRef = ref(database, `rooms/${SESSION.roomId}/data`);
+    await set(dbRef, { payload: enc, ts });
+    // 自分の操作は即座に画面反映
+    refreshAll();
+    const activePg = document.querySelector('.pg.on');
+    if (activePg && activePg.id === 'pg-history') renderHistory();
+    setSyncDot('on');
+  } catch(e) {
+    console.error(e);
+    setSyncDot('err');
+    showToast('⚠️ 同期エラー。接続を確認してください。');
+  }
+}
+
+let lastPushTs = 0;
+function startRealtimeSync() {
+  if (unsubscribe) unsubscribe();
+  const dbRef = ref(database, `rooms/${SESSION.roomId}/data`);
+  unsubscribe = onValue(dbRef, async (snapshot) => {
+    const val = snapshot.val();
+    if (!val || !val.payload) return;
+    // 自分がたった今プッシュしたデータは無視（二重更新防止）
+    if (val.ts && Math.abs(val.ts - lastPushTs) < 2000) return;
+    const dec = await decrypt(SESSION.cryptoKey, val.payload);
+    if (!dec) return;
+    DB = dec;
+    refreshAll();
+    // 現在開いているページも再描画
+    const activePg = document.querySelector('.pg.on');
+    if (activePg && activePg.id === 'pg-history') renderHistory();
+    if (activePg && activePg.id === 'pg-advice') renderAdvice();
+    setSyncDot('on');
+  }, (error) => {
+    setSyncDot('err');
+  });
+}
+
+// ===== ログイン =====
+function showLoginTab(tab) {
+  document.getElementById('tab-join').style.display = tab === 'join' ? '' : 'none';
+  document.getElementById('tab-create').style.display = tab === 'create' ? '' : 'none';
+}
+
+async function createRoom() {
+  const rid = document.getElementById('inp-new-room').value.trim();
+  const pw = document.getElementById('inp-new-pw').value;
+  const pw2 = document.getElementById('inp-new-pw2').value;
+  const name = document.getElementById('inp-new-name').value.trim();
+  if (!rid || !pw || !name) { showToast('⚠️ 全て入力してください'); return; }
+  if (pw.length < 8) { showToast('⚠️ パスワードは8文字以上'); return; }
+  if (pw !== pw2) { showToast('⚠️ パスワードが一致しません'); return; }
+  if (!/^[a-zA-Z0-9\-_]+$/.test(rid)) { showToast('⚠️ ルームIDは半角英数・ハイフンのみ'); return; }
+  showToast('🔐 ルームを作成中...', 4000);
+  try {
+    // 既存チェック
+    const snap = await get(ref(database, `rooms/${rid}`));
+    if (snap.exists()) { showToast('⚠️ このルームIDはすでに使われています'); return; }
+    await startSession(rid, pw, name);
+    showToast('✅ ルームを作成しました！家族にIDとパスワードを教えてください');
+  } catch(e) {
+    showToast('❌ エラーが発生しました: ' + e.message, 4000);
+  }
+}
+
+async function joinRoom() {
+  const rid = document.getElementById('inp-room-id').value.trim();
+  const pw = document.getElementById('inp-room-pw').value;
+  const name = document.getElementById('inp-user-name').value.trim();
+  if (!rid || !pw || !name) { showToast('⚠️ 全て入力してください'); return; }
+  showToast('🔐 接続中...', 4000);
+  try {
+    const key = await deriveKey(rid, pw);
+    // データ取得して復号テスト
+    const snap = await get(ref(database, `rooms/${rid}/data`));
+    if (snap.exists()) {
+      const val = snap.val();
+      const dec = await decrypt(key, val.payload);
+      if (!dec) { showToast('❌ パスワードが違います', 4000); return; }
+      DB = dec;
+    }
+    await startSession(rid, pw, name);
+    showToast('✅ ' + rid + ' に参加しました');
+  } catch(e) {
+    showToast('❌ ルームIDまたはパスワードが違います', 4000);
+  }
+}
+
+async function startSession(rid, pw, name) {
+  const key = await deriveKey(rid, pw);
+  const hash = await sha256(rid + pw);
+  SESSION = {roomId: rid, userName: name, cryptoKey: key, pwHash: hash};
+  localStorage.setItem('hlt_session', JSON.stringify({roomId: rid, pwHash: hash, userName: name}));
+  showMainScreen();
+  startRealtimeSync();
+}
+
+function logout() {
+  if (!confirm('ログアウトしますか？')) return;
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  SESSION = {roomId:'', userName:'', cryptoKey:null, pwHash:''};
+  localStorage.removeItem('hlt_session');
+  // パスワード欄だけ必ず空にする
+  document.getElementById('inp-room-pw').value = '';
+  document.getElementById('inp-new-pw').value = '';
+  document.getElementById('inp-new-pw2').value = '';
+  document.getElementById('main-screen').style.display = 'none';
+  document.getElementById('login-screen').style.display = '';
+  showToast('ログアウトしました');
+}
+
+function showMainScreen() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('main-screen').style.display = '';
+  document.getElementById('hdr-date').textContent = todayStr();
+  document.getElementById('room-badge').textContent = '👨‍👩‍👧 ' + SESSION.roomId;
+  document.getElementById('info-room').textContent = SESSION.roomId;
+  document.getElementById('info-user').textContent = SESSION.userName;
+  refreshAll();
+}
+
+// ===== ページ遷移 =====
+function goPage(p) {
+  document.querySelectorAll('.pg,.nb').forEach(e => e.classList.remove('on'));
+  document.getElementById('pg-' + p).classList.add('on');
+  const idx = {today:0, graph:1, history:2, advice:3, settings:4}[p];
+  document.querySelectorAll('.nb')[idx].classList.add('on');
+  if (p === 'graph') renderGraphs();
+  if (p === 'history') renderHistory();
+  if (p === 'advice') renderAdvice();
+}
+window.goPage = goPage;
+
+// ===== モーダル =====
+function openMod(n) {
+  document.getElementById('mod-' + n).classList.add('on');
+  const dtEl = document.getElementById('dt-' + n);
+  if (dtEl) dtEl.value = nowDTLocal();
+  if (n === 'water') document.getElementById('wt-m').textContent = todaySum('water');
+  resetTMP();
+}
+function closeMod(n) { document.getElementById('mod-' + n).classList.remove('on'); }
+function resetTMP() { TMP = {uv:0, uc:'', ucn:'', sc:'', scn:'', shape:'', sa:''}; }
+window.openMod = openMod;
+window.closeMod = closeMod;
+
+// ===== データ集計 =====
+function todayRecs(key) { return DB[key].filter(r => dtToKey(r.dt) === todayKey()); }
+function todaySum(key) { return todayRecs(key).reduce((a, r) => a + (r.val || r.vol || 0), 0); }
+function todayCount(key) { return todayRecs(key).length; }
+function todayLast(key) { const r = todayRecs(key); return r.length ? r[r.length-1] : null; }
+
+// ===== ステータス =====
+function bpSt(s,d) { if(s>=140||d>=90) return['高め','bad']; if(s>=130||d>=80) return['やや高め','warn']; return['正常','ok']; }
+function tempSt(t) { if(t>=38) return['発熱','bad']; if(t>=37) return['微熱','warn']; return['正常','ok']; }
+function spo2St(v) { if(v<=93) return['要受診','bad']; if(v<=95) return['注意','warn']; return['正常','ok']; }
+function waterSt(v) { if(v>=1500) return['十分','ok']; if(v>=800) return['もう少し','warn']; return['不足','bad']; }
+
+// ===== カード更新 =====
+function updCnt(key, n) {
+  const el = document.getElementById('cnt-' + key);
+  if (n > 0) { el.style.display = ''; el.textContent = n + '回'; } else el.style.display = 'none';
+}
+function refreshBP() {
+  const r = todayLast('bp'); updCnt('bp', todayCount('bp'));
+  if (!r) return;
+  document.getElementById('dv-bp').innerHTML = `${r.sys}/${r.dia}<span class="mc-unit"> mmHg</span>`;
+  const [t,c] = bpSt(r.sys, r.dia);
+  const st = document.getElementById('st-bp'); st.textContent = t; st.className = 'mc-st ' + c;
+  document.getElementById('time-bp').textContent = dtToDisplay(r.dt);
+}
+function refreshTemp() {
+  const r = todayLast('temp'); updCnt('temp', todayCount('temp'));
+  if (!r) return;
+  document.getElementById('dv-temp').innerHTML = `${r.val}<span class="mc-unit"> ℃</span>`;
+  const [t,c] = tempSt(r.val);
+  const st = document.getElementById('st-temp'); st.textContent = t; st.className = 'mc-st ' + c;
+  document.getElementById('time-temp').textContent = dtToDisplay(r.dt);
+}
+function refreshSpo2() {
+  const r = todayLast('spo2'); updCnt('spo2', todayCount('spo2'));
+  if (!r) return;
+  document.getElementById('dv-spo2').innerHTML = `${r.val}<span class="mc-unit"> %</span>`;
+  const [t,c] = spo2St(r.val);
+  const st = document.getElementById('st-spo2'); st.textContent = t; st.className = 'mc-st ' + c;
+}
+function refreshWater() {
+  const tot = todaySum('water'); updCnt('water', todayCount('water'));
+  document.getElementById('dv-water').innerHTML = `${tot}<span class="mc-unit"> ml</span>`;
+  const [t,c] = waterSt(tot);
+  const st = document.getElementById('st-water'); st.textContent = t; st.className = 'mc-st ' + c;
+}
+function refreshUrine() {
+  const recs = todayRecs('urine');
+  const tot = recs.reduce((a,r) => a + (r.vol||0), 0);
+  document.getElementById('dv-urine').innerHTML = `${tot}<span class="mc-unit"> ml</span>`;
+  const cnt = recs.length; updCnt('urine', cnt);
+  const st = document.getElementById('st-urine');
+  st.textContent = cnt > 0 ? cnt + '回記録済み' : '未記録'; st.className = 'mc-st ' + (cnt > 0 ? 'ok' : 'none');
+  const last = recs[recs.length-1];
+  if (last && last.color) document.getElementById('ucd').style.background = last.color;
+}
+function refreshStool() {
+  const recs = todayRecs('stool'); const cnt = recs.length;
+  document.getElementById('dv-stool').innerHTML = `${cnt}<span class="mc-unit"> 回</span>`;
+  updCnt('stool', cnt);
+  const st = document.getElementById('st-stool');
+  st.textContent = cnt > 0 ? cnt + '回記録済み' : '未記録'; st.className = 'mc-st ' + (cnt > 0 ? 'ok' : 'none');
+  const last = recs[recs.length-1];
+  if (last && last.color) document.getElementById('scd').style.background = last.color;
+}
+function refreshAll() { refreshBP(); refreshTemp(); refreshSpo2(); refreshWater(); refreshUrine(); refreshStool(); loadPhotos(); }
+
+// ===== 保存 =====
+async function persist() { await pushToFirebase(); }
+
+window.saveBP = async function() {
+  const s = +document.getElementById('inp-bp-s').value;
+  const d = +document.getElementById('inp-bp-d').value;
+  const dt = document.getElementById('dt-bp').value || nowDTLocal();
+  if (!s || !d) { showToast('⚠️ 血圧を入力してください'); return; }
+  DB.bp.push({dt, sys:s, dia:d, user:SESSION.userName});
+  DB.bp.sort((a,b) => a.dt.localeCompare(b.dt));
+  refreshBP(); closeMod('bp'); await persist();
+  document.getElementById('inp-bp-s').value = '';
+  document.getElementById('inp-bp-d').value = '';
+  showToast('✅ 血圧を保存しました');
+};
+window.saveTemp = async function() {
+  const t = parseFloat(document.getElementById('inp-temp').value);
+  const dt = document.getElementById('dt-temp').value || nowDTLocal();
+  if (!t) { showToast('⚠️ 体温を入力してください'); return; }
+  DB.temp.push({dt, val:t, user:SESSION.userName});
+  DB.temp.sort((a,b) => a.dt.localeCompare(b.dt));
+  refreshTemp(); closeMod('temp'); await persist();
+  document.getElementById('inp-temp').value = '';
+  showToast('✅ 体温を保存しました');
+};
+window.saveSpo2 = async function() {
+  const v = +document.getElementById('inp-spo2').value;
+  const dt = document.getElementById('dt-spo2').value || nowDTLocal();
+  if (!v) { showToast('⚠️ 酸素濃度を入力してください'); return; }
+  DB.spo2.push({dt, val:v, user:SESSION.userName});
+  DB.spo2.sort((a,b) => a.dt.localeCompare(b.dt));
+  refreshSpo2(); closeMod('spo2'); await persist();
+  document.getElementById('inp-spo2').value = '';
+  showToast('✅ 酸素濃度を保存しました');
+};
+window.setWP = function(ml) { document.getElementById('inp-water').value = ml; };
+window.saveWater = async function() {
+  const v = +document.getElementById('inp-water').value;
+  const dt = document.getElementById('dt-water').value || nowDTLocal();
+  if (!v) { showToast('⚠️ 水分量を入力してください'); return; }
+  DB.water.push({dt, val:v, user:SESSION.userName});
+  DB.water.sort((a,b) => a.dt.localeCompare(b.dt));
+  refreshWater(); closeMod('water'); await persist();
+  document.getElementById('inp-water').value = '';
+  showToast('✅ 水分を追加しました');
+};
+window.pickA = function(el, key, val) {
+  el.parentElement.querySelectorAll('.ao').forEach(b => b.classList.remove('on'));
+  el.classList.add('on');
+  if (key === 'uv') TMP.uv = val;
+  else if (key === 'sa') TMP.sa = val;
+};
+window.pickC = function(el, key, color, name) {
+  el.parentElement.querySelectorAll('.co').forEach(b => b.classList.remove('on'));
+  el.classList.add('on');
+  if (key === 'uc') { TMP.uc = color; TMP.ucn = name; }
+  else { TMP.sc = color; TMP.scn = name; }
+};
+window.pickS = function(el, val) {
+  document.querySelectorAll('.so').forEach(b => b.classList.remove('on'));
+  el.classList.add('on'); TMP.shape = val;
+};
+window.saveUrine = async function() {
+  const dt = document.getElementById('dt-urine').value || nowDTLocal();
+  DB.urine.push({dt, vol:TMP.uv, color:TMP.uc, colorName:TMP.ucn, user:SESSION.userName});
+  DB.urine.sort((a,b) => a.dt.localeCompare(b.dt));
+  refreshUrine(); closeMod('urine'); await persist();
+  showToast('✅ 排尿を記録しました');
+};
+window.saveStool = async function() {
+  const dt = document.getElementById('dt-stool').value || nowDTLocal();
+  DB.stool.push({dt, amount:TMP.sa, color:TMP.sc, colorName:TMP.scn, shape:TMP.shape, user:SESSION.userName});
+  DB.stool.sort((a,b) => a.dt.localeCompare(b.dt));
+  refreshStool(); closeMod('stool'); await persist();
+  showToast('✅ 排便を記録しました');
+};
+
+// ===== 詳細（今日） =====
+const detTitles = {bp:'❤️ 血圧（今日）', temp:'🌡️ 体温（今日）', spo2:'💨 酸素濃度（今日）', water:'💧 水分摂取（今日）', urine:'🚽 排尿（今日）', stool:'💩 排便（今日）'};
+window.openDet = function(key) {
+  const recs = todayRecs(key);
+  if (!recs.length) { showToast('まだ今日の記録がありません'); return; }
+  document.getElementById('det-tit').innerHTML = `${detTitles[key]}<button class="mcls" onclick="closeDet()">✕</button>`;
+  renderDetBody(key, recs, false);
+  document.getElementById('dov').classList.add('on');
+};
+
+function recToDisplay(key, r) {
+  let val = '', sub = '';
+  if (key==='bp') { val=`${r.sys}/${r.dia} mmHg`; const[t]=bpSt(r.sys,r.dia); sub=t; }
+  else if (key==='temp') { val=`${r.val}℃`; const[t]=tempSt(r.val); sub=t; }
+  else if (key==='spo2') { val=`${r.val}%`; const[t]=spo2St(r.val); sub=t; }
+  else if (key==='water') { val=`${r.val}ml`; }
+  else if (key==='urine') { val=`${r.vol||'--'}ml`; sub=r.colorName?'色：'+r.colorName:''; }
+  else if (key==='stool') { val=r.amount||'--'; sub=[r.colorName?'色：'+r.colorName:'', r.shape||''].filter(Boolean).join(' '); }
+  return {val, sub};
+}
+
+function renderDetBody(key, recs, fromHistory) {
+  let html = '';
+  recs.forEach((r, i) => {
+    const {val, sub} = recToDisplay(key, r);
+    const dot = r.color ? `<span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:${r.color};vertical-align:middle;margin-left:5px"></span>` : '';
+    const gi = DB[key].indexOf(r);
+    html += `<div class="dr">
+      <div>
+        <div class="dt-info">${dtToDisplay(r.dt)}&nbsp;<span style="color:#6a3fbf;font-weight:700">${r.user||''}</span></div>
+        <div style="font-size:11px;color:var(--muted)">${sub}</div>
+      </div>
+      <div style="display:flex;align-items:center">
+        <div class="dv">${val}${dot}</div>
+        <button class="dbtn" onclick="delRecGlobal('${key}',${gi},${fromHistory})">削除</button>
+      </div>
+    </div>`;
+  });
+  if (key==='water'||key==='urine') {
+    const tot = recs.reduce((a,r) => a+(r.val||r.vol||0), 0);
+    html += `<div style="text-align:right;font-weight:800;font-size:14px;padding-top:8px;color:var(--blue)">合計：${tot}ml</div>`;
+  }
+  document.getElementById('det-body').innerHTML = html;
+}
+
+window.closeDet = function() { document.getElementById('dov').classList.remove('on'); };
+
+// グローバルインデックスで削除（今日詳細・履歴詳細の両方から呼ばれる）
+window.delRecGlobal = async function(key, globalIdx, fromHistory) {
+  if (!confirm('この記録を削除しますか？\n※削除すると元に戻せません')) return;
+  if (globalIdx > -1) DB[key].splice(globalIdx, 1);
+  const rfs = {bp:refreshBP, temp:refreshTemp, spo2:refreshSpo2, water:refreshWater, urine:refreshUrine, stool:refreshStool};
+  if (rfs[key]) rfs[key]();
+  await persist();
+  showToast('🗑️ 削除しました');
+  window.closeDet();
+  if (fromHistory) renderHistory();
+};
+
+// ===== 写真 =====
+let photoTarget = '';
+const photoLabels = {'meal-morning':'朝食','meal-lunch':'昼食','meal-dinner':'夕食','meal-snack':'間食','stool-photo':'便の写真','skin':'皮膚','pain':'不具合','other':'その他'};
+window.trigP = function(t) { photoTarget = t; document.getElementById('pi').click(); };
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('pi').addEventListener('change', function(e) {
+    if (!e.target.files[0]) return;
+    const r = new FileReader();
+    r.onload = async ev => {
+      DB.photos[photoTarget] = ev.target.result;
+      setThumb(photoTarget, ev.target.result);
+      await persist(); showToast('✅ 写真を保存しました');
+    };
+    r.readAsDataURL(e.target.files[0]);
+    this.value = '';
+  });
+});
+function setThumb(k, url) {
+  const th = document.getElementById('pt-' + k);
+  if (!th) return;
+  th.classList.add('has');
+  th.innerHTML = `<img src="${url}"><div class="plbl">${photoLabels[k]||k}</div>`;
+}
+function loadPhotos() {
+  Object.keys(DB.photos).forEach(k => { if (DB.photos[k]) setThumb(k, DB.photos[k]); });
+}
+
+// ===== グラフ =====
+window.setRange = function(r, el) {
+  graphRange = r;
+  document.querySelectorAll('.grb').forEach(b => b.classList.remove('on'));
+  el.classList.add('on'); renderGraphs();
+};
+function getLabels(range) {
+  const labels = [], keys = [];
+  const now = new Date();
+  let n, step;
+  if (range==='7d') { n=7; step='day'; }
+  else if (range==='1m') { n=30; step='day'; }
+  else if (range==='3m') { n=13; step='week'; }
+  else if (range==='6m') { n=6; step='month'; }
+  else { n=12; step='month'; }
+  for (let i=n-1; i>=0; i--) {
+    const d = new Date(now);
+    if (step==='day') d.setDate(d.getDate()-i);
+    else if (step==='week') d.setDate(d.getDate()-i*7);
+    else d.setMonth(d.getMonth()-i);
+    const lbl = step==='month' ? `${d.getMonth()+1}月` : `${d.getMonth()+1}/${d.getDate()}`;
+    labels.push(lbl);
+    const yk = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const ym = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    keys.push(step==='month' ? ym : yk);
+  }
+  return {labels, keys, step};
+}
+function aggData(arr, keys, step, valFn, agg='last') {
+  return keys.map(k => {
+    let recs;
+    if (step==='month') recs = arr.filter(r => r.dt && r.dt.slice(0,7)===k);
+    else if (step==='week') {
+      const base = new Date(k); const end = new Date(base); end.setDate(end.getDate()+6);
+      recs = arr.filter(r => { if(!r.dt) return false; const rd=new Date(r.dt.slice(0,10)); return rd>=base&&rd<=end; });
+    } else recs = arr.filter(r => r.dt && r.dt.slice(0,10)===k);
+    if (!recs.length) return null;
+    const vals = recs.map(valFn).filter(v => v != null);
+    if (!vals.length) return null;
+    if (agg==='avg') return parseFloat((vals.reduce((a,v)=>a+v,0)/vals.length).toFixed(1));
+    if (agg==='sum') return vals.reduce((a,v)=>a+v,0);
+    return vals[vals.length-1];
+  });
+}
+function renderGraphs() {
+  const {labels, keys, step} = getLabels(graphRange);
+  const co = {responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{grid:{color:'rgba(0,0,0,0.04)'}, ticks:{font:{size:10}, maxRotation:45}}, y:{grid:{color:'rgba(0,0,0,0.05)'}, ticks:{font:{size:10}}}}};
+  function mk(id, cfg) { if(chartInst[id]) chartInst[id].destroy(); const c=document.getElementById(id); if(c) chartInst[id]=new Chart(c,cfg); }
+  const sys=aggData(DB.bp,keys,step,r=>r.sys,'avg'), dia=aggData(DB.bp,keys,step,r=>r.dia,'avg');
+  mk('gc-bp',{type:'line',data:{labels,datasets:[{label:'上',data:sys,borderColor:'#e53e3e',backgroundColor:'rgba(229,62,62,0.07)',tension:.4,fill:true,pointRadius:3,pointBackgroundColor:'#e53e3e'},{label:'下',data:dia,borderColor:'#3182ce',backgroundColor:'rgba(49,130,206,0.04)',tension:.4,fill:false,pointRadius:3,pointBackgroundColor:'#3182ce'}]},options:{...co,plugins:{legend:{display:true,position:'top',labels:{font:{size:11},boxWidth:14}}}}});
+  mk('gc-temp',{type:'line',data:{labels,datasets:[{data:aggData(DB.temp,keys,step,r=>r.val,'avg'),borderColor:'#e67e22',backgroundColor:'rgba(230,126,34,0.08)',tension:.4,fill:true,pointRadius:3,pointBackgroundColor:'#e67e22'}]},options:{...co,scales:{...co.scales,y:{...co.scales.y,min:35,max:40,ticks:{callback:v=>v+'℃',font:{size:10}}}}}});
+  mk('gc-spo2',{type:'line',data:{labels,datasets:[{data:aggData(DB.spo2,keys,step,r=>r.val,'avg'),borderColor:'#0a8a9a',backgroundColor:'rgba(10,138,154,0.08)',tension:.4,fill:true,pointRadius:3,pointBackgroundColor:'#0a8a9a'}]},options:{...co,scales:{...co.scales,y:{...co.scales.y,min:88,max:100,ticks:{callback:v=>v+'%',font:{size:10}}}}}});
+  mk('gc-water',{type:'bar',data:{labels,datasets:[{data:aggData(DB.water,keys,step,r=>r.val,'sum'),backgroundColor:'rgba(49,130,206,0.5)',borderColor:'#3182ce',borderWidth:1.5,borderRadius:5}]},options:{...co,scales:{...co.scales,y:{...co.scales.y,ticks:{callback:v=>v+'ml',font:{size:10}}}}}});
+  mk('gc-urine',{type:'bar',data:{labels,datasets:[{data:aggData(DB.urine,keys,step,r=>r.vol||0,'sum'),backgroundColor:'rgba(192,120,10,0.45)',borderColor:'#b45309',borderWidth:1.5,borderRadius:5}]},options:{...co,scales:{...co.scales,y:{...co.scales.y,ticks:{callback:v=>v+'ml',font:{size:10}}}}}});
+}
+
+// ===== 履歴 =====
+// ===== 履歴フィルター =====
+const keyMeta = {
+  bp:    {label:'❤️ 血圧',  fn:r=>`${r.sys}/${r.dia} mmHg`},
+  temp:  {label:'🌡️ 体温', fn:r=>`${r.val}℃`},
+  spo2:  {label:'💨 SpO₂', fn:r=>`${r.val}%`},
+  water: {label:'💧 水分',  fn:r=>`${r.val}ml`},
+  urine: {label:'🚽 排尿',  fn:r=>`${r.vol||'--'}ml`+(r.colorName?' / '+r.colorName:'')},
+  stool: {label:'💩 排便',  fn:r=>[r.amount,r.colorName,r.shape].filter(Boolean).join(' / ')}
+};
+let histFilter = 'all';
+window.setHistFilter = function(f, el) {
+  histFilter = f;
+  document.querySelectorAll('.hfb').forEach(b => b.classList.remove('on'));
+  el.classList.add('on');
+  renderHistory();
+};
+function renderHistory() {
+  const all = [];
+  Object.entries(keyMeta).forEach(([key, meta]) => {
+    DB[key].forEach((r, gi) => {
+      all.push({dt:r.dt, user:r.user||'', type:meta.label, val:meta.fn(r), key, gi});
+    });
+  });
+  all.sort((a,b) => b.dt.localeCompare(a.dt));
+  const filtered = histFilter==='all' ? all : all.filter(a => a.key===histFilter);
+  const el = document.getElementById('hist-list');
+  if (!filtered.length) { el.innerHTML='<div style="text-align:center;color:var(--muted);padding:40px;font-size:15px">まだ記録がありません</div>'; return; }
+  el.innerHTML = filtered.slice(0,100).map(a => `<div class="hi">
+    <div style="flex:1;min-width:0">
+      <div class="hd">${dtToDisplay(a.dt)}&nbsp;<span style="color:#6a3fbf;font-weight:700">${a.user}</span></div>
+      <div class="htp">${a.type}</div>
+    </div>
+    <div class="hv" style="margin:0 8px;white-space:nowrap">${a.val}</div>
+    <button class="dbtn" style="font-size:12px;padding:5px 10px;flex-shrink:0"
+      onclick="confirmDelHist('${a.key}',${a.gi})">🗑️ 削除</button>
+  </div>`).join('');
+}
+window.confirmDelHist = async function(key, gi) {
+  const r = DB[key][gi];
+  if (!r) { showToast('⚠️ 記録が見つかりません'); return; }
+  const {val, sub} = recToDisplay(key, r);
+  const msg = `この記録を削除しますか？\n\n種類：${keyMeta[key].label}\n日時：${dtToDisplay(r.dt)}\n値：${val}\n\n※削除すると元に戻せません`;
+  if (!confirm(msg)) return;
+  DB[key].splice(gi, 1);
+  const rfs = {bp:refreshBP,temp:refreshTemp,spo2:refreshSpo2,water:refreshWater,urine:refreshUrine,stool:refreshStool};
+  if (rfs[key]) rfs[key]();
+  await persist();
+  showToast('🗑️ 削除しました');
+  renderHistory();
+};
+
+// ===== アドバイス =====
+function renderAdvice() {
+  const adv = [];
+  const lb = DB.bp[DB.bp.length-1];
+  const ls = DB.spo2[DB.spo2.length-1];
+  const tw = todaySum('water');
+  if (lb) { const[t,c]=bpSt(lb.sys,lb.dia); if(c==='bad') adv.push({ico:'⚠️',tit:'血圧が高い状態です',txt:`最新の血圧が${lb.sys}/${lb.dia}mmHgです。塩分を控え十分な休息を。継続する場合はかかりつけ医に相談を。`,cls:'red'}); else if(c==='warn') adv.push({ico:'📋',tit:'血圧がやや高めです',txt:'少し高めの傾向があります。水分を十分に取り、ストレスを避けましょう。',cls:'amber'}); else adv.push({ico:'✅',tit:'血圧は正常範囲です',txt:'良好な血圧が保たれています。毎日の記録を続けましょう。',cls:'green'}); }
+  else adv.push({ico:'❤️',tit:'血圧を測りましょう',txt:'毎朝同じ時間に測ることで変化に気づきやすくなります。',cls:'blue'});
+  if (ls) { const[t,c]=spo2St(ls.val); if(c==='bad') adv.push({ico:'🚨',tit:'酸素濃度に注意！',txt:`SpO₂が${ls.val}%です。93%以下が続く場合はすぐに受診を。`,cls:'red'}); else if(c==='warn') adv.push({ico:'💨',tit:'酸素濃度がやや低め',txt:`SpO₂が${ls.val}%です。深呼吸を意識し換気を良くしましょう。`,cls:'amber'}); }
+  if (tw < 800) adv.push({ico:'💧',tit:'水分が不足しています',txt:`今日は${tw}mlです。1日1500〜2000mlを目標にこまめに飲みましょう。`,cls:'amber'});
+  else if (tw >= 1500) adv.push({ico:'💧',tit:'水分補給できています',txt:`今日は${tw}mlが取れています。この調子で続けましょう。`,cls:'green'});
+  const st = todayRecs('stool');
+  if (st.some(r => r.color==='#ef4444'||r.color==='#1c1917')) adv.push({ico:'⚠️',tit:'便の色に注意',txt:'赤色・黒色の便は出血のサインの可能性があります。続く場合は医療機関へ。',cls:'red'});
+  adv.push({ico:'🚶',tit:'毎日の軽い運動を',txt:'1日15〜20分のウォーキングが血圧改善・筋力維持に効果的です。',cls:'blue'});
+  document.getElementById('adv-list').innerHTML = adv.map(a => `<div class="ac ${a.cls}"><div class="ai">${a.ico}</div><div class="at">${a.tit}</div><div class="atx">${a.txt}</div></div>`).join('');
+}
+
+// ===== グローバル公開 =====
+window.showLoginTab = showLoginTab;
+window.createRoom = createRoom;
+window.joinRoom = joinRoom;
+window.logout = logout;
+window.renderHistory = renderHistory;
+window.renderAdvice = renderAdvice;
+window.renderGraphs = renderGraphs;
+
+// ===== 起動 =====
+window.addEventListener('DOMContentLoaded', async () => {
+  document.getElementById('hdr-date').textContent = todayStr();
+  const s = JSON.parse(localStorage.getItem('hlt_session') || 'null');
+  if (s && s.roomId) {
+    // ルームIDと名前だけ復元。パスワードは必ず手入力させる
+    document.getElementById('inp-room-id').value = s.roomId;
+    document.getElementById('inp-room-pw').value = '';       // パスワード欄は空に
+    document.getElementById('inp-user-name').value = s.userName || '';
+    showToast('前回のルーム「' + s.roomId + '」を検出しました。パスワードを入力してください。', 4000);
+  }
+});
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+--bg:#f0f4f8;--card:#fff;--text:#1a2a3a;--muted:#5a7a9a;
+--blue:#1a6fbf;--blt:#e8f2fc;--green:#1a9a5a;--glt:#e8f8ef;
+--red:#c0392b;--rlt:#fdecea;--amber:#c0780a;--alt:#fef4e4;
+--teal:#0a8a9a;--tlt:#e4f6f8;--purple:#6a3fbf;--plt:#f0ecfc;
+--border:#dde6ee;--r:18px;--rs:12px;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans','Yu Gothic',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.app{max-width:500px;margin:0 auto;padding:0 0 90px}
+.hdr{background:linear-gradient(135deg,#1a6fbf,#0a8a9a);color:#fff;padding:14px 16px;position:sticky;top:0;z-index:100}
+.hdr-top{display:flex;align-items:center;gap:10px}
+.hdr h1{font-size:18px;font-weight:800;flex:1}
+.sync-dot{width:10px;height:10px;border-radius:50%;background:#aaa;flex-shrink:0;transition:background .3s}
+.sync-dot.on{background:#4ade80}
+.sync-dot.sync{background:#fbbf24;animation:pulse .8s infinite}
+.sync-dot.err{background:#f87171}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.hdr-sub{font-size:11px;opacity:.8;margin-top:3px;display:flex;justify-content:space-between}
+.room-badge{background:rgba(255,255,255,.2);border-radius:20px;padding:2px 8px;font-size:11px;font-weight:700}
+.nav{display:flex;background:#fff;border-bottom:1px solid var(--border);position:sticky;top:62px;z-index:99;overflow-x:auto}
+.nav::-webkit-scrollbar{display:none}
+.nb{flex:none;padding:11px 13px;font-size:13px;font-weight:700;border:none;background:none;color:var(--muted);cursor:pointer;border-bottom:3px solid transparent;white-space:nowrap}
+.nb.on{color:var(--blue);border-bottom-color:var(--blue)}
+.pg{display:none;padding:14px}.pg.on{display:block}
+.sec{font-size:16px;font-weight:800;margin:16px 0 10px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+.mc{background:#fff;border-radius:var(--r);padding:13px;border:1.5px solid var(--border);cursor:pointer;transition:transform .12s;position:relative;overflow:hidden}
+.mc:active{transform:scale(.97)}
+.mc.full{grid-column:1/-1}
+.mc.blue{border-color:#a8ccee;background:linear-gradient(150deg,#fff 60%,#eef6ff)}
+.mc.green{border-color:#a8ddc0;background:linear-gradient(150deg,#fff 60%,#eefff6)}
+.mc.teal{border-color:#a0d8de;background:linear-gradient(150deg,#fff 60%,#eefbfc)}
+.mc.amber{border-color:#f0cc90;background:linear-gradient(150deg,#fff 60%,#fffbee)}
+.mc.purple{border-color:#c9b0ee;background:linear-gradient(150deg,#fff 60%,#f6f0ff)}
+.mc-ico{font-size:22px;margin-bottom:5px}
+.mc-lbl{font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px}
+.mc-val{font-size:20px;font-weight:800;line-height:1.15}
+.mc-unit{font-size:11px;font-weight:500;color:var(--muted)}
+.mc-st{font-size:11px;padding:2px 7px;border-radius:20px;display:inline-block;font-weight:700;margin-top:4px}
+.ok{background:var(--glt);color:var(--green)}.warn{background:var(--alt);color:var(--amber)}.bad{background:var(--rlt);color:var(--red)}.none{background:#f0f4f8;color:var(--muted)}
+.mc-cnt{position:absolute;top:8px;right:10px;background:var(--blue);color:#fff;border-radius:20px;font-size:10px;font-weight:800;padding:2px 6px}
+.mc-time{font-size:10px;color:var(--muted);margin-top:2px}
+.iadd{width:100%;background:linear-gradient(90deg,var(--blue),var(--teal));color:#fff;border:none;border-radius:10px;padding:8px;font-size:13px;font-weight:800;cursor:pointer;margin-top:7px}
+.psec{background:#fff;border-radius:var(--r);border:1.5px solid var(--border);overflow:hidden;margin-bottom:10px}
+.phdr{padding:11px 14px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border)}
+.phdr span{font-size:17px}.phdr h3{font-size:14px;font-weight:700}
+.pgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:10px}
+.pt{aspect-ratio:1;background:var(--bg);border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border:2px dashed var(--border);font-size:10px;color:var(--muted);gap:3px;position:relative;overflow:hidden;transition:all .15s}
+.pt:active{transform:scale(.95)}.pt.has{border-style:solid}.pt img{width:100%;height:100%;object-fit:cover;position:absolute}
+.pt .plbl{position:absolute;bottom:0;width:100%;background:rgba(0,0,0,.55);color:#fff;font-size:10px;font-weight:700;padding:2px;text-align:center;z-index:1}
+.pt .padd{font-size:20px}
+.ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;align-items:flex-end}.ov.on{display:flex}
+.mod{background:#fff;border-radius:24px 24px 0 0;padding:20px;width:100%;max-height:90vh;overflow-y:auto}
+.mtit{font-size:18px;font-weight:800;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.mcls{margin-left:auto;background:var(--bg);border:none;width:32px;height:32px;border-radius:50%;font-size:17px;cursor:pointer;flex-shrink:0}
+.fg{margin-bottom:14px}.fl{font-size:15px;font-weight:700;margin-bottom:7px;display:block}
+.fi{width:100%;border:2px solid var(--border);border-radius:var(--rs);padding:11px 13px;font-size:20px;font-weight:700;text-align:center;background:#fff;color:var(--text);font-family:inherit}
+.fi:focus{outline:none;border-color:var(--blue)}.fi-dt{font-size:15px;text-align:left;padding:10px 12px}
+.fnote{font-size:11px;color:var(--muted);margin-top:3px}
+.row{display:flex;gap:7px;flex-wrap:wrap}
+.opt{flex:1;min-width:60px;padding:9px 4px;border:2px solid var(--border);border-radius:9px;background:#fff;font-size:12px;font-weight:700;cursor:pointer;text-align:center;transition:all .12s}
+.opt.on{border-color:var(--blue);background:var(--blt);color:var(--blue)}
+.svbtn{width:100%;background:var(--green);color:#fff;border:none;border-radius:var(--r);padding:14px;font-size:16px;font-weight:800;cursor:pointer;margin-top:6px}
+.svbtn:active{opacity:.85}
+.cgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}
+.co{height:42px;border-radius:7px;border:3px solid transparent;cursor:pointer;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;transition:all .12s}
+.co.on{border-color:#1a2a3a;transform:scale(1.06)}
+.sgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
+.so{padding:8px 3px;border:2px solid var(--border);border-radius:7px;text-align:center;cursor:pointer;font-size:10px;font-weight:700;background:#fff;transition:all .12s}
+.so.on{border-color:var(--blue);background:var(--blt);color:var(--blue)}
+.agrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.ao{padding:10px 5px;border:2px solid var(--border);border-radius:9px;text-align:center;cursor:pointer;font-size:12px;font-weight:700;background:#fff;transition:all .12s}
+.ao.on{border-color:var(--blue);background:var(--blt);color:var(--blue)}
+.dov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:300;align-items:flex-end}.dov.on{display:flex}
+.dmod{background:#fff;border-radius:24px 24px 0 0;padding:20px;width:100%;max-height:86vh;overflow-y:auto}
+.dr{display:flex;justify-content:space-between;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--border)}.dr:last-child{border:none}
+.dt-info{font-size:11px;color:var(--muted);font-weight:600}.dv{font-size:15px;font-weight:800}
+.dbtn{background:var(--rlt);color:var(--red);border:none;border-radius:6px;padding:3px 7px;font-size:10px;font-weight:700;cursor:pointer;margin-left:7px}
+.gc{background:#fff;border-radius:var(--r);border:1.5px solid var(--border);padding:13px;margin-bottom:11px}
+.gt{font-size:14px;font-weight:800;margin-bottom:9px}.gw{position:relative;height:175px}
+.grange{display:flex;gap:5px;margin-bottom:14px;overflow-x:auto}.grange::-webkit-scrollbar{display:none}
+.grb{flex:none;padding:6px 12px;border:2px solid var(--border);border-radius:18px;background:#fff;font-size:12px;font-weight:700;cursor:pointer;color:var(--muted)}
+.grb.on{border-color:var(--blue);background:var(--blt);color:var(--blue)}
+.hi{background:#fff;border-radius:var(--rs);border:1px solid var(--border);padding:11px 13px;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.hd{font-size:11px;color:var(--muted);font-weight:600}.hv{font-size:15px;font-weight:800}.htp{font-size:11px;color:var(--muted)}
+.ac{border-radius:var(--r);padding:13px;margin-bottom:9px}
+.ac.blue{background:var(--blt);border:1.5px solid #a8ccee}.ac.green{background:var(--glt);border:1.5px solid #a8ddc0}
+.ac.amber{background:var(--alt);border:1.5px solid #f0cc90}.ac.red{background:var(--rlt);border:1.5px solid #f0b8b2}
+.ai{font-size:24px;margin-bottom:5px}.at{font-size:14px;font-weight:800;margin-bottom:3px}.atx{font-size:12px;line-height:1.6}
+.login-wrap{min-height:60vh;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:24px;gap:16px}
+.login-card{background:#fff;border-radius:var(--r);border:1.5px solid var(--border);padding:24px;width:100%;max-width:360px}
+.login-title{font-size:20px;font-weight:800;margin-bottom:6px;text-align:center}
+.login-sub{font-size:13px;color:var(--muted);text-align:center;margin-bottom:20px;line-height:1.6}
+.lfi{width:100%;border:2px solid var(--border);border-radius:var(--rs);padding:12px 14px;font-size:16px;background:#fff;color:var(--text);font-family:inherit;margin-bottom:10px}
+.lfi:focus{outline:none;border-color:var(--blue)}
+.lbtn{width:100%;padding:13px;border:none;border-radius:var(--rs);font-size:15px;font-weight:800;cursor:pointer;transition:opacity .15s}
+.lbtn:active{opacity:.85}.lbtn.pri{background:var(--blue);color:#fff;margin-bottom:8px}.lbtn.sec{background:var(--green);color:#fff}.lbtn.out{background:var(--rlt);color:var(--red)}
+.sec-info{background:var(--blt);border:1px solid #a8ccee;border-radius:var(--rs);padding:12px;font-size:12px;line-height:1.7;color:#0c447c}
+.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#1a2a3a;color:#fff;border-radius:20px;padding:10px 20px;font-size:13px;font-weight:700;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap}
+.toast.show{opacity:1}
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+<div id="login-screen">
+<div class="login-wrap">
+  <div style="font-size:48px;text-align:center">🏥</div>
+  <div class="login-card">
+    <div class="login-title">健康記録ノート</div>
+    <div class="login-sub">家族でリアルタイム共有<br>AES-256暗号化で安全に管理</div>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button class="lbtn pri" style="margin:0;flex:1;font-size:13px" onclick="showLoginTab('join')">参加する</button>
+      <button class="lbtn sec" style="margin:0;flex:1;font-size:13px" onclick="showLoginTab('create')">新規作成</button>
+    </div>
+    <div id="tab-join">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">ルームID</label>
+      <input class="lfi" id="inp-room-id" placeholder="例：yamada-family" type="text" autocapitalize="none">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">パスワード</label>
+      <input class="lfi" id="inp-room-pw" placeholder="パスワード" type="password">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">あなたの名前</label>
+      <input class="lfi" id="inp-user-name" placeholder="例：太郎" type="text">
+      <button class="lbtn pri" onclick="joinRoom()">参加する →</button>
+    </div>
+    <div id="tab-create" style="display:none">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">ルームID（半角英数・ハイフン）</label>
+      <input class="lfi" id="inp-new-room" placeholder="例：yamada-family" type="text" autocapitalize="none">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">パスワード（8文字以上）</label>
+      <input class="lfi" id="inp-new-pw" placeholder="パスワード" type="password">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">パスワード確認</label>
+      <input class="lfi" id="inp-new-pw2" placeholder="もう一度入力" type="password">
+      <label style="font-size:13px;font-weight:700;color:var(--muted);display:block;margin-bottom:4px">あなたの名前</label>
+      <input class="lfi" id="inp-new-name" placeholder="例：花子" type="text">
+      <button class="lbtn sec" onclick="createRoom()">ルームを作成 →</button>
+    </div>
+    <div style="height:14px"></div>
+    <div class="sec-info">🔒 AES-256暗号化・パスワード非送信・HTTPS通信</div>
+  </div>
+</div>
+</div>
+
+<div id="main-screen" style="display:none">
+<div class="hdr">
+  <div class="hdr-top">
+    <h1>🏥 健康記録ノート</h1>
+    <div class="sync-dot on" id="sync-dot"></div>
+  </div>
+  <div class="hdr-sub">
+    <span id="hdr-date"></span>
+    <span class="room-badge" id="room-badge"></span>
+  </div>
+</div>
+<div class="nav">
+  <button class="nb on" onclick="goPage('today')">今日</button>
+  <button class="nb" onclick="goPage('graph')">グラフ</button>
+  <button class="nb" onclick="goPage('history')">履歴</button>
+  <button class="nb" onclick="goPage('advice')">アドバイス</button>
+  <button class="nb" onclick="goPage('settings')">設定</button>
+</div>
+
+<div id="pg-today" class="pg on">
+  <div class="sec">📊 今日の数値</div>
+  <div class="g2">
+    <div class="mc blue" onclick="openDet('bp')"><div class="mc-ico">❤️</div><div class="mc-lbl">血圧</div><div class="mc-val" id="dv-bp">--<span class="mc-unit">/--</span></div><div id="st-bp" class="mc-st none">未記録</div><div class="mc-time" id="time-bp"></div><div class="mc-cnt" id="cnt-bp" style="display:none"></div><button class="iadd" onclick="event.stopPropagation();openMod('bp')">＋ 入力</button></div>
+    <div class="mc green" onclick="openDet('temp')"><div class="mc-ico">🌡️</div><div class="mc-lbl">体温</div><div class="mc-val" id="dv-temp">--<span class="mc-unit">℃</span></div><div id="st-temp" class="mc-st none">未記録</div><div class="mc-time" id="time-temp"></div><div class="mc-cnt" id="cnt-temp" style="display:none"></div><button class="iadd" onclick="event.stopPropagation();openMod('temp')">＋ 入力</button></div>
+    <div class="mc teal" onclick="openDet('spo2')"><div class="mc-ico">💨</div><div class="mc-lbl">酸素濃度</div><div class="mc-val" id="dv-spo2">--<span class="mc-unit">%</span></div><div id="st-spo2" class="mc-st none">未記録</div><div class="mc-time" id="time-spo2"></div><div class="mc-cnt" id="cnt-spo2" style="display:none"></div><button class="iadd" onclick="event.stopPropagation();openMod('spo2')">＋ 入力</button></div>
+    <div class="mc blue" onclick="openDet('water')"><div class="mc-ico">💧</div><div class="mc-lbl">水分（累計）</div><div class="mc-val" id="dv-water">0<span class="mc-unit">ml</span></div><div id="st-water" class="mc-st none">未記録</div><div class="mc-cnt" id="cnt-water" style="display:none"></div><button class="iadd" onclick="event.stopPropagation();openMod('water')">＋ 追加</button></div>
+    <div class="mc amber full" onclick="openDet('urine')"><div style="display:flex;align-items:flex-start;gap:12px"><div style="flex:1"><div class="mc-ico">🚽</div><div class="mc-lbl">排尿（累計）</div><div class="mc-val" id="dv-urine">0<span class="mc-unit">ml</span></div><div id="st-urine" class="mc-st none">未記録</div><div class="mc-cnt" id="cnt-urine" style="display:none"></div></div><div style="text-align:right"><div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">最新の色</div><div id="ucd" style="width:34px;height:34px;border-radius:8px;background:#ddd;border:2px solid #ccc"></div></div></div><button class="iadd" style="width:100%;margin-top:7px" onclick="event.stopPropagation();openMod('urine')">＋ 記録</button></div>
+    <div class="mc purple full" onclick="openDet('stool')"><div style="display:flex;align-items:flex-start;gap:12px"><div style="flex:1"><div class="mc-ico">💩</div><div class="mc-lbl">排便（累計回数）</div><div class="mc-val" id="dv-stool">0<span class="mc-unit">回</span></div><div id="st-stool" class="mc-st none">未記録</div><div class="mc-cnt" id="cnt-stool" style="display:none"></div></div><div style="text-align:right"><div style="font-size:10px;color:var(--muted);font-weight:700;margin-bottom:3px">最新の色</div><div id="scd" style="width:34px;height:34px;border-radius:8px;background:#ddd;border:2px solid #ccc"></div></div></div><button class="iadd" style="width:100%;margin-top:7px" onclick="event.stopPropagation();openMod('stool')">＋ 記録</button></div>
+  </div>
+  <div class="sec">📷 写真記録</div>
+  <div class="psec"><div class="phdr"><span>🍱</span><h3>食事の記録</h3></div><div class="pgrid"><div class="pt" onclick="trigP('meal-morning')" id="pt-meal-morning"><div class="padd">＋</div><span>朝食</span></div><div class="pt" onclick="trigP('meal-lunch')" id="pt-meal-lunch"><div class="padd">＋</div><span>昼食</span></div><div class="pt" onclick="trigP('meal-dinner')" id="pt-meal-dinner"><div class="padd">＋</div><span>夕食</span></div><div class="pt" onclick="trigP('meal-snack')" id="pt-meal-snack"><div class="padd">＋</div><span>間食</span></div></div></div>
+  <div class="psec"><div class="phdr"><span>🔍</span><h3>体の状態・便の記録</h3></div><div class="pgrid"><div class="pt" onclick="trigP('stool-photo')" id="pt-stool-photo"><div class="padd">＋</div><span style="text-align:center;line-height:1.3">便の<br>写真</span></div><div class="pt" onclick="trigP('skin')" id="pt-skin"><div class="padd">＋</div><span style="text-align:center;line-height:1.3">皮膚の<br>状態</span></div><div class="pt" onclick="trigP('pain')" id="pt-pain"><div class="padd">＋</div><span style="text-align:center;line-height:1.3">不具合<br>箇所</span></div><div class="pt" onclick="trigP('other')" id="pt-other"><div class="padd">＋</div><span>その他</span></div></div></div>
+</div>
+
+<div id="pg-graph" class="pg">
+  <div class="grange"><button class="grb on" onclick="setRange('7d',this)">1週間</button><button class="grb" onclick="setRange('1m',this)">1ヶ月</button><button class="grb" onclick="setRange('3m',this)">3ヶ月</button><button class="grb" onclick="setRange('6m',this)">半年</button><button class="grb" onclick="setRange('1y',this)">1年</button></div>
+  <div class="gc"><div class="gt">❤️ 血圧</div><div class="gw"><canvas id="gc-bp"></canvas></div></div>
+  <div class="gc"><div class="gt">🌡️ 体温</div><div class="gw"><canvas id="gc-temp"></canvas></div></div>
+  <div class="gc"><div class="gt">💨 酸素濃度（SpO₂）</div><div class="gw"><canvas id="gc-spo2"></canvas></div></div>
+  <div class="gc"><div class="gt">💧 水分摂取量</div><div class="gw"><canvas id="gc-water"></canvas></div></div>
+  <div class="gc"><div class="gt">🚽 排尿量</div><div class="gw"><canvas id="gc-urine"></canvas></div></div>
+</div>
+<div id="pg-history" class="pg">
+  <div class="sec">📋 記録履歴</div>
+  <div style="display:flex;gap:6px;overflow-x:auto;margin-bottom:12px;padding-bottom:2px">
+    <button class="hfb grb on" onclick="setHistFilter('all',this)">すべて</button>
+    <button class="hfb grb" onclick="setHistFilter('bp',this)">❤️ 血圧</button>
+    <button class="hfb grb" onclick="setHistFilter('temp',this)">🌡️ 体温</button>
+    <button class="hfb grb" onclick="setHistFilter('spo2',this)">💨 SpO₂</button>
+    <button class="hfb grb" onclick="setHistFilter('water',this)">💧 水分</button>
+    <button class="hfb grb" onclick="setHistFilter('urine',this)">🚽 排尿</button>
+    <button class="hfb grb" onclick="setHistFilter('stool',this)">💩 排便</button>
+  </div>
+  <div id="hist-list"></div>
+</div>
+<div id="pg-advice" class="pg"><div class="sec">💡 健康アドバイス</div><div id="adv-list"></div></div>
+<div id="pg-settings" class="pg">
+  <div class="sec">⚙️ 設定</div>
+  <div class="login-card" style="max-width:100%;margin-bottom:12px">
+    <div style="font-size:14px;font-weight:800;margin-bottom:10px">現在のルーム情報</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:4px">ルームID</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:12px;word-break:break-all" id="info-room"></div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:4px">ログイン中のユーザー</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:12px" id="info-user"></div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:10px;line-height:1.6">このルームIDとパスワードを家族に教えることで共有できます</div>
+    <button class="lbtn out" onclick="logout()">ログアウト</button>
+  </div>
+  <div class="sec-info">🔒 AES-256-GCM暗号化 / パスワード非送信 / Firebase HTTPS通信 / ルームID＋パスワード両方必要</div>
+</div>
+</div><!-- /main -->
+
+<!-- 入力モーダル群 -->
+<div class="ov" id="mod-bp" onclick="closeMod('bp')"><div class="mod" onclick="event.stopPropagation()"><div class="mtit">❤️ 血圧を記録<button class="mcls" onclick="closeMod('bp')">✕</button></div><div class="fg"><label class="fl">計測日時</label><input class="fi fi-dt" type="datetime-local" id="dt-bp"></div><div class="fg"><label class="fl">最高血圧（上）mmHg</label><input class="fi" type="number" id="inp-bp-s" placeholder="120" inputmode="numeric"><div class="fnote">正常：130未満　高め：130〜139　高い：140以上</div></div><div class="fg"><label class="fl">最低血圧（下）mmHg</label><input class="fi" type="number" id="inp-bp-d" placeholder="80" inputmode="numeric"><div class="fnote">正常：80未満　高め：80〜89　高い：90以上</div></div><button class="svbtn" onclick="saveBP()">✅ 保存する</button></div></div>
+<div class="ov" id="mod-temp" onclick="closeMod('temp')"><div class="mod" onclick="event.stopPropagation()"><div class="mtit">🌡️ 体温を記録<button class="mcls" onclick="closeMod('temp')">✕</button></div><div class="fg"><label class="fl">計測日時</label><input class="fi fi-dt" type="datetime-local" id="dt-temp"></div><div class="fg"><label class="fl">体温（℃）</label><input class="fi" type="number" id="inp-temp" placeholder="36.5" step="0.1" inputmode="decimal"><div class="fnote">正常：36〜37℃　微熱：37〜38℃　発熱：38℃以上</div></div><button class="svbtn" onclick="saveTemp()">✅ 保存する</button></div></div>
+<div class="ov" id="mod-spo2" onclick="closeMod('spo2')"><div class="mod" onclick="event.stopPropagation()"><div class="mtit">💨 酸素濃度を記録<button class="mcls" onclick="closeMod('spo2')">✕</button></div><div class="fg"><label class="fl">計測日時</label><input class="fi fi-dt" type="datetime-local" id="dt-spo2"></div><div class="fg"><label class="fl">SpO₂（%）</label><input class="fi" type="number" id="inp-spo2" placeholder="98" min="80" max="100" inputmode="numeric"><div class="fnote">正常：96%以上　注意：94〜95%　要受診：93%以下</div></div><button class="svbtn" onclick="saveSpo2()">✅ 保存する</button></div></div>
+<div class="ov" id="mod-water" onclick="closeMod('water')"><div class="mod" onclick="event.stopPropagation()"><div class="mtit">💧 水分を追加<button class="mcls" onclick="closeMod('water')">✕</button></div><div class="fg"><label class="fl">飲んだ日時</label><input class="fi fi-dt" type="datetime-local" id="dt-water"></div><div class="fg"><label class="fl">量を選ぶ</label><div class="row"><button class="opt" onclick="setWP(100)">小コップ<br><span style="font-size:10px;color:var(--muted)">100ml</span></button><button class="opt" onclick="setWP(200)">大コップ<br><span style="font-size:10px;color:var(--muted)">200ml</span></button><button class="opt" onclick="setWP(350)">缶<br><span style="font-size:10px;color:var(--muted)">350ml</span></button><button class="opt" onclick="setWP(500)">ペット<br><span style="font-size:10px;color:var(--muted)">500ml</span></button></div></div><div class="fg"><label class="fl">または直接入力（ml）</label><input class="fi" type="number" id="inp-water" placeholder="200" inputmode="numeric"></div><div style="text-align:center;font-size:16px;font-weight:800;margin-bottom:8px;color:var(--blue)">今日の累計：<span id="wt-m">0</span> ml</div><button class="svbtn" onclick="saveWater()">✅ 保存する</button></div></div>
+<div class="ov" id="mod-urine" onclick="closeMod('urine')"><div class="mod" onclick="event.stopPropagation()"><div class="mtit">🚽 排尿を記録<button class="mcls" onclick="closeMod('urine')">✕</button></div><div class="fg"><label class="fl">日時</label><input class="fi fi-dt" type="datetime-local" id="dt-urine"></div><div class="fg"><label class="fl">排尿量の目安</label><div class="agrid"><div class="ao" onclick="pickA(this,'uv',100)">少ない<br><span style="font-size:10px;color:var(--muted)">〜100ml</span></div><div class="ao" onclick="pickA(this,'uv',250)">普通<br><span style="font-size:10px;color:var(--muted)">〜300ml</span></div><div class="ao" onclick="pickA(this,'uv',400)">多い<br><span style="font-size:10px;color:var(--muted)">300ml〜</span></div></div></div><div class="fg"><label class="fl">尿の色</label><div class="cgrid"><div class="co" style="background:#fef9c3;color:#7a6000" onclick="pickC(this,'uc','#fef9c3','ほぼ無色')">ほぼ無色</div><div class="co" style="background:#fde68a;color:#7a4f00" onclick="pickC(this,'uc','#fde68a','薄黄')">薄黄色</div><div class="co" style="background:#f59e0b;color:#fff" onclick="pickC(this,'uc','#f59e0b','黄色')">黄色</div><div class="co" style="background:#d97706;color:#fff" onclick="pickC(this,'uc','#d97706','濃黄')">濃い黄</div><div class="co" style="background:#b45309;color:#fff" onclick="pickC(this,'uc','#b45309','茶色')">茶色</div><div class="co" style="background:#ef4444;color:#fff" onclick="pickC(this,'uc','#ef4444','赤色')">赤色</div><div class="co" style="background:#ec4899;color:#fff" onclick="pickC(this,'uc','#ec4899','ピンク')">ピンク</div><div class="co" style="background:#6b7280;color:#fff" onclick="pickC(this,'uc','#6b7280','にごり')">にごり</div></div></div><button class="svbtn" onclick="saveUrine()">✅ 保存する</button></div></div>
+<div class="ov" id="mod-stool" onclick="closeMod('stool')"><div class="mod" onclick="event.stopPropagation()"><div class="mtit">💩 排便を記録<button class="mcls" onclick="closeMod('stool')">✕</button></div><div class="fg"><label class="fl">日時</label><input class="fi fi-dt" type="datetime-local" id="dt-stool"></div><div class="fg"><label class="fl">量</label><div class="agrid"><div class="ao" onclick="pickA(this,'sa','少')">少ない</div><div class="ao" onclick="pickA(this,'sa','普')">普通</div><div class="ao" onclick="pickA(this,'sa','多')">多い</div></div></div><div class="fg"><label class="fl">色</label><div class="cgrid"><div class="co" style="background:#fbbf24;color:#7a4f00" onclick="pickC(this,'sc','#fbbf24','黄色')">黄色</div><div class="co" style="background:#d97706;color:#fff" onclick="pickC(this,'sc','#d97706','黄褐色')">黄褐色</div><div class="co" style="background:#92400e;color:#fff" onclick="pickC(this,'sc','#92400e','茶色')">茶色</div><div class="co" style="background:#422006;color:#fff" onclick="pickC(this,'sc','#422006','黒褐色')">黒褐色</div><div class="co" style="background:#1c1917;color:#fff" onclick="pickC(this,'sc','#1c1917','黒色')">黒色</div><div class="co" style="background:#ef4444;color:#fff" onclick="pickC(this,'sc','#ef4444','赤色')">赤色</div><div class="co" style="background:#86efac;color:#15803d" onclick="pickC(this,'sc','#86efac','緑色')">緑色</div><div class="co" style="background:#e5e7eb;color:#374151" onclick="pickC(this,'sc','#e5e7eb','白色')">白色</div></div></div><div class="fg"><label class="fl">形状（ブリストルスケール）</label><div class="sgrid"><div class="so" onclick="pickS(this,'1型')">タイプ1<br><span style="font-size:9px;color:var(--muted)">ころころ</span></div><div class="so" onclick="pickS(this,'2型')">タイプ2<br><span style="font-size:9px;color:var(--muted)">硬い</span></div><div class="so" onclick="pickS(this,'3型')">タイプ3<br><span style="font-size:9px;color:var(--muted)">やや硬い</span></div><div class="so" onclick="pickS(this,'4型')">タイプ4<br><span style="font-size:9px;color:var(--muted)">理想的</span></div><div class="so" onclick="pickS(this,'5型')">タイプ5<br><span style="font-size:9px;color:var(--muted)">軟便</span></div><div class="so" onclick="pickS(this,'6型')">タイプ6<br><span style="font-size:9px;color:var(--muted)">泥状</span></div><div class="so" onclick="pickS(this,'7型')">タイプ7<br><span style="font-size:9px;color:var(--muted)">水様</span></div></div></div><button class="svbtn" onclick="saveStool()">✅ 保存する</button></div></div>
+
+<div class="dov" id="dov" onclick="closeDet()"><div class="dmod" onclick="event.stopPropagation()"><div class="mtit" id="det-tit">詳細<button class="mcls" onclick="closeDet()">✕</button></div><div id="det-body"></div></div></div>
+<div class="toast" id="toast"></div>
+<input type="file" id="pi" accept="image/*" capture="environment">
+</div>
+</body>
+</html>
